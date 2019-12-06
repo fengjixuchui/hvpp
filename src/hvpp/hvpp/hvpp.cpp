@@ -17,12 +17,9 @@ using namespace hvpp;
 #define vcpu_                                                 ((vcpu_t*)Vcpu)
 #define ept_                                                  ((ept_t*)Ept)
 
-extern "C" {
-
-static
 NTSTATUS
 NTAPI
-ErrorCodeToNtStatus(
+HvppErrorCodeToNtStatus(
   error_code_t error
   )
 {
@@ -34,11 +31,64 @@ ErrorCodeToNtStatus(
     : STATUS_UNSUCCESSFUL;
 }
 
+error_code_t
+NTAPI
+HvppNtStatusToErrorCode(
+  NTSTATUS Status
+  )
+{
+  if (!NT_SUCCESS(Status))
+  {
+    return make_error_code_t(std::errc::operation_not_supported);
+  }
+
+  return {};
+}
+
+extern "C" {
+
 //////////////////////////////////////////////////////////////////////////
 // ept.h
 //////////////////////////////////////////////////////////////////////////
 
 #pragma region ept.h
+
+PEPT
+NTAPI
+HvppEptCreate(
+  VOID
+  )
+{
+  return (PEPT)(new ept_t{});
+}
+
+VOID
+NTAPI
+HvppEptDestroy(
+  _In_ PEPT Ept
+  )
+{
+  delete ept_;
+}
+
+VOID
+NTAPI
+HvppEptMapIdentity(
+  _In_ PEPT Ept
+  )
+{
+  ept_->map_identity();
+}
+
+VOID
+NTAPI
+HvppEptMapIdentityEx(
+  _In_ PEPT Ept,
+  _In_ ULONG Access
+  )
+{
+  ept_->map_identity((epte_t::access_type)(Access));
+}
 
 PEPTE
 NTAPI
@@ -252,7 +302,10 @@ HvppDestroy(
 NTSTATUS
 NTAPI
 HvppStart(
-  _In_ PVMEXIT_HANDLER VmExitHandler
+  _In_ PVMEXIT_HANDLER VmExitHandler,
+  _In_ PVMEXIT_HANDLER_SETUP_ROUTINE SetupRoutine,
+  _In_ PVMEXIT_HANDLER_TEARDOWN_ROUTINE TeardownRoutine,
+  _In_ PVMEXIT_HANDLER_TERMINATE_ROUTINE TerminateRoutine
   )
 {
   //
@@ -267,13 +320,13 @@ HvppStart(
   //
 
   hvpp_assert(c_exit_handler == nullptr);
-  c_exit_handler = new vmexit_c_wrapper_handler(c_handlers);
+  c_exit_handler = new vmexit_c_wrapper_handler(c_handlers, SetupRoutine, TeardownRoutine, TerminateRoutine, NULL);
 
   //
   // Start the hypervisor.
   //
 
-  return ErrorCodeToNtStatus(hypervisor::start(*c_exit_handler));
+  return HvppErrorCodeToNtStatus(hypervisor::start(*c_exit_handler));
 }
 
 VOID
@@ -309,11 +362,10 @@ HvppIsRunning(
 VOID
 NTAPI
 HvppVcpuEnableEpt(
-  _In_ PVCPU Vcpu,
-  _In_ USHORT Count
+  _In_ PVCPU Vcpu
   )
 {
-  vcpu_->ept_enable(Count);
+  vcpu_->ept_enable();
 }
 
 VOID
@@ -325,42 +377,23 @@ HvppVcpuDisableEpt(
   vcpu_->ept_disable();
 }
 
-USHORT
+PEPT
 NTAPI
-HvppVcpuGetEptIndex(
+HvppVcpuGetEpt(
   _In_ PVCPU Vcpu
   )
 {
-  return vcpu_->ept_index();
+  return (PEPT)(&vcpu_->ept());
 }
 
 VOID
 NTAPI
-HvppVcpuSetEptIndex(
+HvppVcpuSetEpt(
   _In_ PVCPU Vcpu,
-  _In_ USHORT Index
+  _In_ PEPT Ept
   )
 {
-  vcpu_->ept_index(Index);
-}
-
-PEPT
-NTAPI
-HvppVcpuGetEpt(
-  _In_ PVCPU Vcpu,
-  _In_ USHORT Index
-  )
-{
-  return (PEPT)&vcpu_->ept(Index);
-}
-
-PEPT
-NTAPI
-HvppVcpuGetCurrentEpt(
-  _In_ PVCPU Vcpu
-  )
-{
-  return (PEPT)&vcpu_->ept(vcpu_->ept_index());
+  vcpu_->ept(*(ept_t*)(Ept));
 }
 
 PVCPU_CONTEXT
@@ -369,7 +402,7 @@ HvppVcpuContext(
   _In_ PVCPU Vcpu
   )
 {
-  return (PVCPU_CONTEXT)&vcpu_->context();
+  return (PVCPU_CONTEXT)(&vcpu_->context());
 }
 
 VOID
@@ -379,6 +412,25 @@ HvppVcpuSuppressRipAdjust(
   )
 {
   vcpu_->suppress_rip_adjust();
+}
+
+PVOID
+NTAPI
+HvppVcpuGetUserData(
+  _In_ PVCPU Vcpu
+  )
+{
+  return vcpu_->user_data();
+}
+
+VOID
+NTAPI
+HvppVcpuSetUserData(
+  _In_ PVCPU Vcpu,
+  _In_ PVOID UserData
+  )
+{
+  vcpu_->user_data(UserData);
 }
 
 #pragma endregion
@@ -437,7 +489,7 @@ HvppVmCall(
   _In_ ULONG_PTR R9
   )
 {
-  return vmx::vmcall(Rcx, Rdx, R8, R9);
+  return vmx::vmcall_fast(Rcx, Rdx, R8, R9);
 }
 
 ULONG_PTR
@@ -455,7 +507,7 @@ HvppVmCallEx(
   _In_ ULONG_PTR R15
   )
 {
-  return vmx::vmcall_ex(Rcx, Rdx, R8, R9, R10, R11, R12, R13, R14, R15);
+  return vmx::vmcall_slow(Rcx, Rdx, R8, R9, R10, R11, R12, R13, R14, R15);
 }
 
 VOID

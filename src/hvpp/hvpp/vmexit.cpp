@@ -94,15 +94,21 @@ void vmexit_handler::teardown(vcpu_t& vp) noexcept
   (void)(vp);
 }
 
+void vmexit_handler::terminate(vcpu_t& vp) noexcept
+{
+  (void)(vp);
+}
+
 void vmexit_handler::handle(vcpu_t& vp) noexcept
 {
   const auto handler_index = static_cast<int>(vp.exit_reason());
   (this->*handlers_[handler_index])(vp);
 }
 
-void vmexit_handler::handle_guest_resume(vcpu_t& vp) noexcept
+void vmexit_handler::handle_guest_resume(vcpu_t& vp, bool was_force_resumed) noexcept
 {
   (void)(vp);
+  (void)(was_force_resumed);
 }
 
 //

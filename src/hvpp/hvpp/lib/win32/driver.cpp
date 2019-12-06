@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include <ntddk.h>
+#include <ntimage.h>
 
 #ifdef min
 # undef min
@@ -20,6 +21,23 @@
 //
 #define ACCESS_FROM_CTL_CODE(ctrlCode)  (((ULONG)(ctrlCode & 0x0000c000)) >> 14)
 
+EXTERN_C
+NTSYSAPI
+PIMAGE_NT_HEADERS
+NTAPI
+RtlImageNtHeader(
+  _In_ PVOID BaseOfImage
+  );
+
+EXTERN_C
+NTSYSAPI
+PVOID
+NTAPI
+RtlPcToFileHeader(
+  _In_ PVOID PcValue,
+  _Out_ PVOID* BaseOfImage
+  );
+
 extern "C"
 {
   DRIVER_INITIALIZE DriverEntry;
@@ -28,25 +46,21 @@ extern "C"
 
 namespace driver
 {
-  void* begin_address = nullptr;
-  void* end_address   = nullptr;
+  void* begin_address               = nullptr;
+  void* end_address                 = nullptr;
+
+  void* kernel_begin_address        = nullptr;
+  void* kernel_end_address          = nullptr;
+
+  void* highest_user_address        = nullptr;
+  void* system_range_start_address  = nullptr;
 }
 
-static
 NTSTATUS
 NTAPI
-ErrorCodeToNtStatus(
+HvppErrorCodeToNtStatus(
   error_code_t error
-  )
-{
-  //
-  // TODO: Something meaningful...
-  //
-  return !error
-    ? STATUS_SUCCESS
-    : STATUS_UNSUCCESSFUL;
-}
-
+  );
 
 NTSTATUS
 NTAPI
@@ -130,7 +144,7 @@ DriverDispatch(
   //
   // Complete the I/O request.
   //
-  Irp->IoStatus.Status = ErrorCodeToNtStatus(err);
+  Irp->IoStatus.Status = HvppErrorCodeToNtStatus(err);
   Irp->IoStatus.Information = BytesTransferred;
 
   IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -170,23 +184,55 @@ DriverEntry(
   UNREFERENCED_PARAMETER(RegistryPath);
 
   GlobalDriverObject = DriverObject;
-
   DriverObject->MajorFunction[IRP_MJ_CREATE]         = &DriverDispatch;
   DriverObject->MajorFunction[IRP_MJ_CLOSE]          = &DriverDispatch;
   DriverObject->MajorFunction[IRP_MJ_READ]           = &DriverDispatch;
   DriverObject->MajorFunction[IRP_MJ_WRITE]          = &DriverDispatch;
   DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = &DriverDispatch;
+  DriverObject->DriverUnload                         = &DriverUnload;
+
+  //
+  // Save the driver address range.
+  //
 
   driver::begin_address = (PVOID)((ULONG_PTR)(DriverObject->DriverStart));
   driver::end_address   = (PVOID)((ULONG_PTR)(DriverObject->DriverStart) + DriverObject->DriverSize);
 
+  //
+  // Save the kernel address range.
+  //
+
+  PVOID  ImageBase = NULL;
+  SIZE_T ImageSize = 0;
+
+  RtlPcToFileHeader((PVOID)&RtlPcToFileHeader, &ImageBase);
+
+  if (!ImageBase)
+  {
+    return STATUS_NOT_FOUND;
+  }
+
+  PIMAGE_NT_HEADERS NtHeaders = (PIMAGE_NT_HEADERS)(RtlImageNtHeader(ImageBase));
+
+  if (!NtHeaders)
+  {
+    return STATUS_NOT_FOUND;
+  }
+
+  ImageSize = NtHeaders->OptionalHeader.SizeOfImage;
+
+  driver::kernel_begin_address = (PVOID)((ULONG_PTR)(ImageBase));
+  driver::kernel_end_address   = (PVOID)((ULONG_PTR)(ImageBase) + ImageSize);
+
+  //
+  // Save the highest user address and system range start address.
+  //
+
+  driver::highest_user_address        = MmHighestUserAddress;
+  driver::system_range_start_address  = MmSystemRangeStart;
+
   auto err = driver::common::initialize(&driver::initialize,
                                         &driver::destroy);
 
-  //
-  // #TODO: Make setting of `DriverUnload' optional.
-  //
-  DriverObject->DriverUnload = &DriverUnload;
-
-  return ErrorCodeToNtStatus(err);
+  return HvppErrorCodeToNtStatus(err);
 }

@@ -44,8 +44,6 @@ vcpu_t::vcpu_t(vmexit_handler& handler) noexcept
   // VM-exit handler is responsible for EPT setup.
   //
   , ept_{}
-  , ept_count_{}
-  , ept_index_{}
 
   //
   // Initialize timestamp-counter members.
@@ -53,6 +51,8 @@ vcpu_t::vcpu_t(vmexit_handler& handler) noexcept
   , tsc_entry_{}
   , tsc_delta_previous_{}
   , tsc_delta_sum_{}
+
+  , user_data_{}
 
   //
   // Well, this is also not necessary.
@@ -63,7 +63,7 @@ vcpu_t::vcpu_t(vmexit_handler& handler) noexcept
   //
   // Fill out initial stack with garbage.
   //
-  memset(stack_.data, 0xcc, sizeof(stack_));
+  memset(&stack_.data, 0xcc, sizeof(stack_));
 
   //
   // Reset CPU contexts.
@@ -90,6 +90,7 @@ vcpu_t::vcpu_t(vmexit_handler& handler) noexcept
     constexpr intptr_t VCPU_CONTEXT_OFFSET              =   0;        // ..
     constexpr intptr_t VCPU_LAUNCH_CONTEXT_OFFSET       =   0;        // ... connected by union {}
                                                                       //
+
     static_assert(VCPU_RSP + VCPU_OFFSET                == offsetof(vcpu_t, stack_));
     static_assert(VCPU_RSP + VCPU_CONTEXT_OFFSET        == offsetof(vcpu_t, context_));
     static_assert(VCPU_RSP + VCPU_LAUNCH_CONTEXT_OFFSET == offsetof(vcpu_t, launch_context_));
@@ -220,12 +221,7 @@ void vcpu_t::stop() noexcept
   // handler to call vcpu_t::vmx_leave(); e.g. VMCALL with specific
   // index.
   //
-  handler_.teardown(*this);
-
-  //
-  // Destroy EPT.
-  //
-  ept_disable();
+  handler_.terminate(*this);
 }
 
 auto vcpu_t::vmx_enter() noexcept -> error_code_t
@@ -234,7 +230,6 @@ auto vcpu_t::vmx_enter() noexcept -> error_code_t
   // Enter VMX operation, invalidate EPT and VPID, load VMCS,
   // set VMCS fields and call handler's setup() method.
   //
-
   if (auto err = load_vmxon())
   { return err; }
 
@@ -342,74 +337,47 @@ void vcpu_t::vmx_leave() noexcept
   // Signalize that this VCPU has terminated.
   //
   state_ = state::terminated;
+
+  //
+  // Finally, call teardown method.
+  //
+  handler_.teardown(*this);
 }
 
-void vcpu_t::ept_enable(uint16_t count /* = 1 */) noexcept
+void vcpu_t::ept_enable() noexcept
 {
-  hvpp_assert(ept_ == nullptr && count > 0);
-
-  //
-  // Allocate all EPTs and initialize them.
-  //
-  ept_ = new ept_t[count];
-  ept_count_ = count;
-  hvpp_assert(ept_ != nullptr);
-
   //
   // Enable EPT.
   //
   auto procbased_ctls2 = processor_based_controls2();
   procbased_ctls2.enable_ept = true;
   processor_based_controls2(procbased_ctls2);
-
-  //
-  // Automatically select the first EPT.
-  //
-  ept_index(0);
 }
 
 void vcpu_t::ept_disable() noexcept
 {
-  if (!ept_)
-  {
-    return;
-  }
-
   //
-  // Disable EPT functionality.
+  // Disable EPT.
   //
-  if (state_ != state::terminated)
-  {
-    auto procbased_ctls2 = processor_based_controls2();
-    procbased_ctls2.enable_ept = false;
-    processor_based_controls2(procbased_ctls2);
-  }
-
-  //
-  // Destroy EPT.
-  //
-  delete[] ept_;
-  ept_ = nullptr;
+  auto procbased_ctls2 = processor_based_controls2();
+  procbased_ctls2.enable_ept = false;
+  processor_based_controls2(procbased_ctls2);
 }
 
-auto vcpu_t::ept_index() noexcept -> uint16_t
+bool vcpu_t::ept_is_enabled() const noexcept
 {
-  return ept_index_;
+  return processor_based_controls2().enable_ept;
 }
 
-void vcpu_t::ept_index(uint16_t index) noexcept
+auto vcpu_t::ept() noexcept -> ept_t&
 {
-  hvpp_assert(index < ept_count_);
-
-  ept_pointer(ept_[index].ept_pointer());
-  ept_index_ = index;
+  return *ept_;
 }
 
-auto vcpu_t::ept(uint16_t index /* = 0 */) noexcept -> ept_t&
+void vcpu_t::ept(ept_t& new_ept) noexcept
 {
-  hvpp_assert(index < ept_count_);
-
-  return ept_[index];
+  ept_ = &new_ept;
+  ept_pointer(ept_->ept_pointer());
 }
 
 auto vcpu_t::context() noexcept -> context_t&
@@ -420,6 +388,16 @@ auto vcpu_t::context() noexcept -> context_t&
 void vcpu_t::suppress_rip_adjust() noexcept
 {
   suppress_rip_adjust_ = true;
+}
+
+auto vcpu_t::user_data() noexcept -> void*
+{
+  return user_data_;
+}
+
+void vcpu_t::user_data(void* new_data) noexcept
+{
+  user_data_ = new_data;
 }
 
 void vcpu_t::guest_resume() noexcept
@@ -443,12 +421,12 @@ auto vcpu_t::guest_va_to_pa(va_t guest_va) noexcept -> pa_t
   return translator_.va_to_pa(guest_va, ::detail::kernel_cr3(guest_cr3()));
 }
 
-auto vcpu_t::guest_read_memory(va_t guest_va, void* buffer, size_t size, bool ignore_errors /* = false*/) noexcept -> va_t
+auto vcpu_t::guest_read_memory(va_t guest_va, void* buffer, size_t size, bool ignore_errors /* = false */) noexcept -> va_t
 {
   return translator_.read(guest_va, ::detail::kernel_cr3(guest_cr3()), buffer, size, ignore_errors);
 }
 
-auto vcpu_t::guest_write_memory(va_t guest_va, const void* buffer, size_t size, bool ignore_errors /* = false*/) noexcept -> va_t
+auto vcpu_t::guest_write_memory(va_t guest_va, const void* buffer, size_t size, bool ignore_errors /* = false */) noexcept -> va_t
 {
   return translator_.write(guest_va, ::detail::kernel_cr3(guest_cr3()), buffer, size, ignore_errors);
 }
@@ -830,6 +808,11 @@ void vcpu_t::entry_host() noexcept
       if (!resume_context_.capture())
       {
         handler_.handle(*this);
+
+        if (state_ != state::terminated)
+        {
+          handler_.handle_guest_resume(*this, false);
+        }
       }
       else
       {
@@ -842,7 +825,7 @@ void vcpu_t::entry_host() noexcept
           stacked_lock_guard_pop();
         }
 
-        handler_.handle_guest_resume(*this);
+        handler_.handle_guest_resume(*this, true);
       }
 
       if (state_ == state::terminated)
