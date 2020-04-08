@@ -41,15 +41,17 @@ ept_t::~ept_t() noexcept
 void ept_t::map_identity(epte_t::access_type access /* = epte_t::access_type::read_write_execute */) noexcept
 {
   //
-  // This method will map the EPT in such way that they'll mirror
+  // This method will map the EPT in such a way that they'll mirror
   // host physical memory to the guest.  This means that physical memory
   // at address 0x4000 in the guest will point to the physical memory
   // at address 0x4000 in the host.
   //
-  // Only first 512 GB of physical memory is covered - hopefully that should
-  // cover most cases - and 2MB pages are used.
+  // Only first 512 GB of physical memory is covered - hopefully, that
+  // should cover most cases, including MMIO - and 2MB pages are used.
+  // There is a good chance that no EPT violations will occur with this
+  // setup (assuming that the EPT structure and/or access is not modified).
   //
-  // Usage of 2MB pages has following benefits:
+  // Usage of 2MB pages has the following benefits:
   //   - Compared to 4kb pages, it requires less memory to cover the same
   //     address space.
   //   - CPU spends less time walking the paging hierarchy (one level less).
@@ -59,20 +61,14 @@ void ept_t::map_identity(epte_t::access_type access /* = epte_t::access_type::re
   // Usage of 2MB pages has also following drawbacks:
   //   - Hooking of 2MB pages is inconvenient as we would get very frequent
   //     EPT violations.  If we want to do EPT hooking on smaller granularity
-  //     (i.e. 4kb) we have to split desired 2MB page into 4kb pages.
+  //     (i.e. 4kb) we have to split the desired 2MB page into 4kb pages.
   //   - Higher risk of MTRR conflict - see mtrr::type() method implementation -
   //     if two or more MTRRs are contained within single 2MB page and those
   //     MTRRs are of different types, the memory type of the whole 2MB page
   //     must be set to "least dangerous" option.  Worst case scenario is if
   //     UC (uncached) memory type collides with something else - the whole page
-  //     must be then set to UC type.  This may result in slight performance
+  //     must be then set to UC type.  This may result in a slight performance
   //     loss.
-  //
-
-  //
-  // TODO:
-  //   - Map only valid physical memory ranges?
-  //   - Map up to max valid physical memory address? (incl. "holes")
   //
 
   static constexpr auto _512gb = 512ull * 1024
@@ -82,6 +78,41 @@ void ept_t::map_identity(epte_t::access_type access /* = epte_t::access_type::re
   for (pa_t pa = 0; pa < _512gb; pa += ept_pd_t::size)
   {
     map_2mb(pa, pa, access);
+  }
+}
+
+void ept_t::map_identity_sparse(epte_t::access_type access /* = epte_t::access_type::read_write_execute */) noexcept
+{
+  //
+  // This method is similar to the map_identity() method above, except that
+  // the memory is covered by using physical_memory_descriptor() as opposed to
+  // covering the first 512 GB of physical memory.
+  //
+  // The benefit of this approach is that it uses significantly less memory
+  // for the EPT structures. Only addresses backed by actual physical memory
+  // are mapped (considering that the machine doesn't have 512 GB+).
+  //
+  // The drawback of this approach is that it doesn't cover MMIO address ranges.
+  // Therefore there is a good chance that you'll receive several EPT violations.
+  // EPT violation handler then should create and map EPT entries for the missing
+  // pages.
+  //
+
+  //
+  // #TODO
+  // Consider combined approach where the first 4GB is mapped unconditionally (most
+  // MMIO is there) and rest is filled with physical_memory_descriptor().
+  //
+
+  for (auto& range : mm::physical_memory_descriptor())
+  {
+    auto from = pa_t{ page_align   (range.begin().value(), pd_t{}) };
+    auto to   = pa_t{ page_align_up(range.end().value(),   pd_t{}) };
+
+    for (pa_t pa = from; pa < to; pa += ept_pd_t::size)
+    {
+      map_2mb(pa, pa, access);
+    }
   }
 }
 

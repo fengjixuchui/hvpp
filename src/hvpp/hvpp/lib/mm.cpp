@@ -18,7 +18,7 @@ namespace mm
     object_t<mtrr_descriptor_t> mtrr_descriptor;
   };
 
-  global_t global;
+  static global_t global;
 
   allocator_guard::allocator_guard() noexcept
     : allocator_guard(global.custom_allocator)
@@ -126,7 +126,7 @@ namespace detail
 
   void generic_free(void* address) noexcept
   {
-    return mm::hypervisor_allocator()->contains(address)
+    return (mm::hypervisor_allocator() && mm::hypervisor_allocator()->contains(address))
       ? mm::hypervisor_allocator()->free(address)
       : mm::system_allocator()->free(address);
   }
